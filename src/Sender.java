@@ -23,6 +23,9 @@ public class Sender {
     private InetSocketAddress remoteAddress = null;  
     private boolean waiting = false;
     private final Gson gson = new Gson();
+    private static final int windowSize = 2;
+    private final JsonObject[] packetWindowBuffer;
+    private int itemsInBuffer;
 
     private final BlockingQueue<String> inputQueue = new LinkedBlockingQueue<>();
 
@@ -32,6 +35,8 @@ public class Sender {
     public Sender(String host, int port) throws IOException {
         this.host = host;
         this.port = port;
+        this.packetWindowBuffer = new JsonObject[2]; //             NOTE: not using this yet
+        this.itemsInBuffer = 0;
         channel = DatagramChannel.open();
         channel.bind(new InetSocketAddress(0));
         channel.configureBlocking(false);
@@ -102,7 +107,6 @@ public class Sender {
 
     public void run() throws IOException {
         startInputThread();
-        int seq = 0;
         while (true) {
             int readyChannels = selector.select(100);
             if (readyChannels > 0) {
@@ -112,7 +116,7 @@ public class Sender {
                     if (key.isReadable()) {
                         JsonObject data = receive();
                         if (data != null) {
-                            waiting = false;  
+                            handleIncomingData(data);
                         }
                     }
                     iter.remove();
@@ -131,21 +135,47 @@ public class Sender {
             }
 
             if (!waiting && pendingData != null) {
-                JsonObject msg = new JsonObject();
-                msg.addProperty("type", "msg");
-                msg.addProperty("data", pendingData);
-                msg.addProperty("seq", seq);
-                send(msg);
-                waiting = true;
-                seq++;
-                pendingData = null;
+                sendNext();
             }
 
             if (eof && !waiting && pendingData == null) {
                 log("All done!");
                 System.exit(0);
             }
+
+            log("current items in buffer: " + itemsInBuffer);
         }
+    }
+
+    private void handleIncomingData(JsonObject data) {
+        if (!data.has("type")) {
+            log("Unknown packet: " + data);
+        }
+
+        if (data.get("type").getAsString().equals("ack")) {
+            //NOTE: come back later and utilize the packet window buffer for retransmits
+            if (itemsInBuffer > 0) {
+                itemsInBuffer--; // a packet has been acked, a slot is freed
+                waiting = false;
+            }
+        }
+
+    }
+
+    private void sendNext() throws IOException {
+        int seq = 0;
+        JsonObject msg = new JsonObject();
+        msg.addProperty("type", "msg");
+        msg.addProperty("data", pendingData);
+        msg.addProperty("seq", seq);
+        send(msg);
+        itemsInBuffer++;
+
+        if (itemsInBuffer >= windowSize) {
+            waiting = true;
+        }
+        seq++;
+        pendingData = null;
     }
 
     public static void main(String[] args) {

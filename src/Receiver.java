@@ -18,13 +18,17 @@ public class Receiver {
     private Selector selector;
     private InetSocketAddress remoteAddress = null;  
     private Gson gson = new Gson();
+    private final Map<Integer, JsonObject> ackTracker;
+    private int lastSeqNum;
 
     public Receiver() throws IOException {
         channel = DatagramChannel.open();
         channel.bind(new InetSocketAddress(0));
         channel.configureBlocking(false);
         selector = Selector.open();
+        lastSeqNum =-1;
         channel.register(selector, SelectionKey.OP_READ);
+        this.ackTracker = new HashMap<>();
         InetSocketAddress local = (InetSocketAddress) channel.getLocalAddress();
         log("Bound to port " + local.getPort());
     }
@@ -77,16 +81,7 @@ public class Receiver {
                     if (key.isReadable()) {
                         JsonObject msg = receive();
                         if (msg != null) {
-                            if (msg.has("data")) {
-                                System.out.print(msg.get("data").getAsString());
-                                System.out.flush();
-                            }
-                            if (msg.has("seq")) {
-                                JsonObject ack = new JsonObject();
-                                ack.addProperty("type", "ack");
-                                ack.addProperty("seq", msg.get("seq").getAsInt());
-                                send(ack);
-                            }
+                           handleIncomingMsg(msg);
                         }
                     }
                     iter.remove();
@@ -94,6 +89,39 @@ public class Receiver {
             }
         }
     }
+    // handle the received message + send an ack
+    private void handleIncomingMsg(JsonObject msg) throws IOException {
+        if (!msg.has("seq") || !msg.has("data")) {
+            log("Received garbage packet!");
+            return; // we got complete garbage that we don't know how to interpret
+        }
+        int receivedSeq = msg.get("seq").getAsInt();
+
+        if (receivedSeq <= lastSeqNum) {
+            log("received duplicate packet");
+            return; // discard the packet. it is a duplicate
+        }
+        lastSeqNum = receivedSeq;
+
+        // sout the data
+        System.out.print(msg.get("data").getAsString());
+        System.out.flush();
+
+        // build and send an ack
+        JsonObject ack = new JsonObject();
+        int seq = msg.get("seq").getAsInt();
+        ack.addProperty("type", "ack");
+        ack.addProperty("seq", seq);
+
+
+        //  ackTracker.put(seq, ack);
+        send(ack);
+
+    }
+
+
+
+
 
     public static void main(String[] args) {
         try {

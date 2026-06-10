@@ -23,9 +23,10 @@ public class Sender {
     private InetSocketAddress remoteAddress = null;  
     private boolean waiting = false;
     private final Gson gson = new Gson();
-    private static final int windowSize = 2;
-    private final JsonObject[] packetWindowBuffer;
+    private static final int maxWindowSize = 2;
+    private final Map<Integer, JsonObject> packetWindow;
     private int itemsInBuffer;
+    private int nextSeq = 0;
 
     private final BlockingQueue<String> inputQueue = new LinkedBlockingQueue<>();
 
@@ -35,7 +36,7 @@ public class Sender {
     public Sender(String host, int port) throws IOException {
         this.host = host;
         this.port = port;
-        this.packetWindowBuffer = new JsonObject[2]; //             NOTE: not using this yet
+        this.packetWindow = new HashMap<>(); //             NOTE: not using this yet
         this.itemsInBuffer = 0;
         channel = DatagramChannel.open();
         channel.bind(new InetSocketAddress(0));
@@ -116,7 +117,7 @@ public class Sender {
                     if (key.isReadable()) {
                         JsonObject data = receive();
                         if (data != null) {
-                            handleIncomingData(data);
+                            handleIncomingAck(data);
                         }
                     }
                     iter.remove();
@@ -143,38 +144,45 @@ public class Sender {
                 System.exit(0);
             }
 
-            log("current items in buffer: " + itemsInBuffer);
+            log("current items in flight: " + packetWindow.size());
         }
     }
 
-    private void handleIncomingData(JsonObject data) {
-        if (!data.has("type")) {
-            log("Unknown packet: " + data);
+    private void handleIncomingAck(JsonObject ack) {
+        // data filtering
+        if (!ack.has("type")) {
+            log("Unknown packet: " + ack); return;
+        }
+        if (!ack.get("type").getAsString().equals("ack")) {
+            log("Non-Ack Received!"); return;
+        }
+        int seq = ack.get("seq").getAsInt();
+
+        JsonObject sent = packetWindow.get(seq); // look up the corresponding sent packet
+        if (sent == null) {
+            log("Questionable or Duplicate ACK Received.");
+            return; // we never sent a packet corresponding to this seq#, or we've already received an ack -> discard
         }
 
-        if (data.get("type").getAsString().equals("ack")) {
-            //NOTE: come back later and utilize the packet window buffer for retransmits
-            if (itemsInBuffer > 0) {
-                itemsInBuffer--; // a packet has been acked, a slot is freed
-                waiting = false;
-            }
+        if (sent.get("seq").getAsInt() == seq) {
+            packetWindow.remove(seq); // remove this packet from the window
+            waiting = false;     // we can now send another packet
         }
-
     }
 
     private void sendNext() throws IOException {
-        int seq = 0;
         JsonObject msg = new JsonObject();
         msg.addProperty("type", "msg");
         msg.addProperty("data", pendingData);
-        msg.addProperty("seq", seq);
-        send(msg);
-        itemsInBuffer++;
+        msg.addProperty("seq", nextSeq);
+        packetWindow.put(nextSeq, msg); // save this message until it's acked
 
-        if (itemsInBuffer >= windowSize) {
-            waiting = true;
+        send(msg); // send it out
+
+        if (packetWindow.size() >= maxWindowSize) {
+            waiting = true; // we have no more 'space' to send other packets until the in-flight ones are acked
         }
-        seq++;
+        nextSeq++; // just increment by 1 for now
         pendingData = null;
     }
 

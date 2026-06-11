@@ -73,7 +73,7 @@ public class Receiver {
         byte[] bytes = new byte[buffer.remaining()];
         buffer.get(bytes);
         String jsonStr = new String(bytes, StandardCharsets.UTF_8);
-        log("Received message " + jsonStr);
+       // log("Received message " + jsonStr);
         return gson.fromJson(jsonStr, JsonObject.class);
     }
 
@@ -100,9 +100,8 @@ public class Receiver {
     }
     // handle the received message + send an ack
     private void handleIncomingMsg(JsonObject msg) throws IOException {
-        log("Intaking: " + msg.get("seq").getAsInt());
         if (!msg.has("seq") || !msg.has("data")) {
-            log("Received garbage packet!");
+            log("Received garbage packet.");
             return; // we got complete garbage that we don't know how to interpret
         }
         int receivedSeq = msg.get("seq").getAsInt();
@@ -111,15 +110,10 @@ public class Receiver {
         send(ack);                              // throttling of the network
 
         if (receivedSeq < expectedSeq) {
-            log("received duplicate packet"); // discard the packet. it is a duplicate
+            log("Received duplicate packet."); // discard the packet. it is a duplicate
             return;
         }
 
-        //boolean alreadyAdded = packets.get(receivedSeq) != null;
-        if (receivedSeq == 8) {
-            log("expected at 8: " + expectedSeq);
-            log("unprocessed packets: " + packets.keySet());
-        }
         if (receivedSeq == expectedSeq) {
             print(msg);                     // sout the data
             expectedSeq++;                  // point to the next packet

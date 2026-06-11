@@ -16,28 +16,29 @@ import com.google.gson.JsonObject;
 
 public class Sender {
     private static final int DATA_SIZE = 1375;
+    public static final double ALPHA = 0.875;
+
     private final String host;
     private final int port;
     private final DatagramChannel channel;
     private final Selector selector;
-    private InetSocketAddress remoteAddress = null;  
-    private boolean waiting = false;
+    private InetSocketAddress remoteAddress = null;
     private final Gson gson = new Gson();
-
-
-
-    private final Map<Integer, PacketContext> packetWindow;
-    private boolean anyDropped;
-    public static final double alpha = 0.875;
-    public  int RTTms = 300;
-    private int maxWindowSize = 1;
-    public int windowGrowthRate = 0;
-    private int nextSeq = 0;
-
+    private final Map<Integer, PacketContext> packetWindow = new HashMap<>();
     private final BlockingQueue<String> inputQueue = new LinkedBlockingQueue<>();
 
-    private String pendingData = null;
+
+
+    // state fields
+    public  int RTTms = 300;
+    private int maxWindowSize = 10;
+    private int nextSeq = 0;
+    private boolean acked = false;
+    private boolean waiting = false;
+    private boolean anyDropped = false;
     private boolean eof = false;
+    private String pendingData = null;
+
 
     public Sender(String host, int port) throws IOException {
         this.host = host;
@@ -50,9 +51,6 @@ public class Sender {
         InetSocketAddress local = (InetSocketAddress) channel.getLocalAddress();
         //log("Sender starting up using ephemeral port " + local.getPort());
         log("Sender starting up using port " + port);
-
-        this.packetWindow = new HashMap<>();
-        anyDropped = false;
     }
 
     private void log(String message) {
@@ -63,9 +61,11 @@ public class Sender {
 
     private void send(JsonObject message) throws IOException {
         String json = gson.toJson(message);
-        log("Sending message '" + json + "'");
+        log("Sending message '" + message.get("seq").getAsInt() + "'");
+        log("Current items in flight: " + packetWindow.size() + "/" + maxWindowSize);
         ByteBuffer buffer = ByteBuffer.wrap(json.getBytes(StandardCharsets.UTF_8));
         channel.send(buffer, new InetSocketAddress(host, port));
+
     }
 
     private JsonObject receive() throws IOException {
@@ -128,43 +128,33 @@ public class Sender {
                     iter.remove();
                 }
             }
+            // our main loop
+            while (!waiting && !eof) {      // we want to absolutely fill open window space
+                updateData();
+                trySendNext();
 
-            if (pendingData == null) {
-                String input = inputQueue.poll();
-                if (input != null) {
-                    if (input.equals("EOF")) {
-                        eof = true;
-                    } else {
-                        pendingData = input;
-                    }
-                }
             }
+            tryRetransmitOutdated();
+            updateWindowSize();
 
-            if (!waiting && pendingData != null) {
-                sendNext();
-            }
+            acked = false;
+            checkExit();
+           // log("current items in flight: " + packetWindow.size() + "/" + maxWindowSize);
 
-            if (!packetWindow.isEmpty()) {
-                tryRetransmitOutdated();
-                adjustWindowSize();
-            }
+        }
+    }
 
-            if (eof && !waiting && pendingData == null && packetWindow.isEmpty()) {
-                log("All done!");
-                System.exit(0);
-            }
-
-            log("current items in flight: " + packetWindow.size());
+    private void checkExit() {
+        if (eof && !waiting && pendingData == null && packetWindow.isEmpty()) {
+            log("All done!");
+            System.exit(0);
         }
     }
 
     private void handleIncomingAck(JsonObject ack) {
         // data filtering
-        if (!ack.has("type")) {
-            log("Unknown packet: " + ack); return;
-        }
-        if (!ack.get("type").getAsString().equals("ack")) {
-            log("Non-Ack Received!"); return;
+        if (!ack.has("type") || !ack.get("type").getAsString().equals("ack")) {
+            log("Unknown packet or Non-Ack received" + ack); return;
         }
         int seq = ack.get("seq").getAsInt();
 
@@ -174,37 +164,41 @@ public class Sender {
             return; // we never sent a packet corresponding to this seq#, or we've already received an ack -> discard
         }
 
-        if (ctx.packet.get("seq").getAsInt() == seq) {
-            packetWindow.remove(seq);                                   // remove this packet from the window
+        if (ctx.packet.get("seq").getAsInt() == seq) {                  // ack corresponds to an in-flight packet
+            packetWindow.remove(seq);                                   // packet is no longer in flight
             long diff = System.currentTimeMillis() - ctx.sendTime;
             recomputeRTT(diff);                                         // estimate rtt
-            waiting = false;                                            // we can now send another packet
+            waiting = packetWindow.size() >= maxWindowSize;             // we can now send another packet
+            acked = true;                                               // we have been acked!
         }
     }
 
-    private void sendNext() throws IOException {
+    private void trySendNext() throws IOException {
+        if (waiting || pendingData == null) return;             // there's nothing left to send or our window is full
         JsonObject msg = new JsonObject();
         msg.addProperty("type", "msg");
         msg.addProperty("data", pendingData);
         msg.addProperty("seq", nextSeq);
-        packetWindow.put(nextSeq, new PacketContext(msg, System.currentTimeMillis())); // save this message until it's acked
+
+        // save this message until it's acked
+        packetWindow.put(nextSeq, new PacketContext(msg, System.currentTimeMillis()));
 
         send(msg); // send it out
-
-        if (packetWindow.size() >= maxWindowSize) {
-            waiting = true; // we have no more 'space' to send other packets until the in-flight ones are acked
-        }
-        nextSeq++; // just increment by 1 for now
-        pendingData = null;
+        // we have no more 'space' to send other packets until the in-flight ones are acked
+        waiting = packetWindow.size() >= maxWindowSize;
+        nextSeq++;                                  // just increment by 1 for now
+        pendingData = null;                         // once sent, clear this data
     }
 
     private void tryRetransmitOutdated() throws IOException {
+        if (packetWindow.isEmpty()) return; // there's nothing to retransmit
+        anyDropped = false;
         for (Map.Entry<Integer, PacketContext> entry : packetWindow.entrySet()) {
             PacketContext ctx = entry.getValue();
             int seq = entry.getKey();
 
             long diff = System.currentTimeMillis() - ctx.sendTime; // track how long ago we sent the packet
-            log("seq: " + seq +  " diff: " + diff);
+            //log("seq: " + seq +  " diff: " + diff);
 
             if (diff > RTTms * 2L) { // timeout occurs, so we must resend.
                 anyDropped = true;
@@ -213,19 +207,36 @@ public class Sender {
                 packetWindow.put(seq, new PacketContext(ctx.packet, System.currentTimeMillis()));  // update the send time
             }
         }
+
+
     }
 
     private void recomputeRTT(long currentRTT) {
-        RTTms = (int) ((alpha * RTTms) + (1-alpha) * currentRTT); // use weighted computing algorithm
+        RTTms = (int) ((ALPHA * RTTms) + (1- ALPHA) * currentRTT); // use weighted computing algorithm
     }
 
-    private void adjustWindowSize() {
-        if (!anyDropped) {
-            maxWindowSize = (int) Math.pow(2.0, windowGrowthRate++); // grow until we drop a packet
+    // uses A.I.M.D although this is the only connection on the network. Ensures fairness in the case of multiple.
+    private void updateWindowSize() {
+        if (!acked) return;
+        if (anyDropped) {
+            maxWindowSize /= 2; // shrink window
         } else {
-            maxWindowSize /= 2; //
+            maxWindowSize++; //(int) Math.pow(2.0, windowGrowthRate++); // grow until we drop a packet
         }
-      //  log("- - - - - New Window: " + maxWindowSize + " - - - - -");
+       // log("- - - - - New Window: " + maxWindowSize + " - - - - -");
+    }
+
+    private void updateData() {
+        if (pendingData == null) {
+            String input = inputQueue.poll();
+            if (input != null) {
+                if (input.equals("EOF")) {
+                    eof = true;
+                } else {
+                    pendingData = input;
+                }
+            }
+        }
     }
 
 

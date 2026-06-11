@@ -24,9 +24,11 @@ public class Sender {
     private boolean waiting = false;
     private final Gson gson = new Gson();
     private static final int maxWindowSize = 5;
-    public static final int RTTms = 1000;
+    public  int RTTms = 300;
     private final Map<Integer, PacketContext> packetWindow;
     private int nextSeq = 0;
+    private final FILOFixedBuffer<Long> slidingWindow;
+
 
     private final BlockingQueue<String> inputQueue = new LinkedBlockingQueue<>();
 
@@ -43,6 +45,7 @@ public class Sender {
         selector = Selector.open();
         channel.register(selector, SelectionKey.OP_READ);
         InetSocketAddress local = (InetSocketAddress) channel.getLocalAddress();
+        this.slidingWindow = new FILOFixedBuffer<Long>(maxWindowSize); // make the sliding window same as buffer
         //log("Sender starting up using ephemeral port " + local.getPort());
         log("Sender starting up using port " + port);
     }
@@ -59,7 +62,6 @@ public class Sender {
         ByteBuffer buffer = ByteBuffer.wrap(json.getBytes(StandardCharsets.UTF_8));
         channel.send(buffer, new InetSocketAddress(host, port));
     }
-
 
     private JsonObject receive() throws IOException {
         ByteBuffer buffer = ByteBuffer.allocate(65535);
@@ -84,7 +86,6 @@ public class Sender {
         log("Received message " + jsonStr);
         return gson.fromJson(jsonStr, JsonObject.class);
     }
-
 
     private void startInputThread() {
         new Thread(() -> {
@@ -167,10 +168,11 @@ public class Sender {
             return; // we never sent a packet corresponding to this seq#, or we've already received an ack -> discard
         }
 
-
-
         if (ctx.packet.get("seq").getAsInt() == seq) {
             packetWindow.remove(seq); // remove this packet from the window
+            long diff = System.currentTimeMillis() - ctx.sendTime;
+            slidingWindow.push(diff);
+            recomputeRTT();         // estimate rtt
             waiting = false;     // we can now send another packet
         }
     }
@@ -197,13 +199,26 @@ public class Sender {
             int seq = entry.getKey();
             long diff = System.currentTimeMillis() - ctx.sendTime;
             log("seq: " + seq +  " diff: " + diff);
-            if (diff > RTTms) {
+
+            if (diff > RTTms * 2L) {
                 log("Resending packet...");
                 send(ctx.packet);
                 packetWindow.put(seq, new PacketContext(ctx.packet, System.currentTimeMillis()));  // update the send time
             }
         }
     }
+
+    private void recomputeRTT() {
+        int rtt = 0;
+        int limit = Math.min(maxWindowSize, slidingWindow.size());
+        for (int i = 0; i < limit; i++) {
+            rtt += slidingWindow.get(i);
+        }
+        rtt /= limit;
+        log("New RTT: " + rtt);
+        this.RTTms = rtt;
+    }
+
 
 
 

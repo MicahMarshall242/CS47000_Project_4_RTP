@@ -23,12 +23,16 @@ public class Sender {
     private InetSocketAddress remoteAddress = null;  
     private boolean waiting = false;
     private final Gson gson = new Gson();
-    private static final int maxWindowSize = 5;
-    public  int RTTms = 300;
-    private final Map<Integer, PacketContext> packetWindow;
-    private int nextSeq = 0;
-    private final FILOFixedBuffer<Long> slidingWindow;
 
+
+
+    private final Map<Integer, PacketContext> packetWindow;
+    private boolean anyDropped;
+    public static final double alpha = 0.875;
+    public  int RTTms = 300;
+    private int maxWindowSize = 1;
+    public int windowGrowthRate = 0;
+    private int nextSeq = 0;
 
     private final BlockingQueue<String> inputQueue = new LinkedBlockingQueue<>();
 
@@ -38,16 +42,17 @@ public class Sender {
     public Sender(String host, int port) throws IOException {
         this.host = host;
         this.port = port;
-        this.packetWindow = new HashMap<>(); //             NOTE: not using this yet
         channel = DatagramChannel.open();
         channel.bind(new InetSocketAddress(0));
         channel.configureBlocking(false);
         selector = Selector.open();
         channel.register(selector, SelectionKey.OP_READ);
         InetSocketAddress local = (InetSocketAddress) channel.getLocalAddress();
-        this.slidingWindow = new FILOFixedBuffer<Long>(maxWindowSize); // make the sliding window same as buffer
         //log("Sender starting up using ephemeral port " + local.getPort());
         log("Sender starting up using port " + port);
+
+        this.packetWindow = new HashMap<>();
+        anyDropped = false;
     }
 
     private void log(String message) {
@@ -140,7 +145,8 @@ public class Sender {
             }
 
             if (!packetWindow.isEmpty()) {
-                retransmitOutdated();
+                tryRetransmitOutdated();
+                adjustWindowSize();
             }
 
             if (eof && !waiting && pendingData == null && packetWindow.isEmpty()) {
@@ -162,18 +168,17 @@ public class Sender {
         }
         int seq = ack.get("seq").getAsInt();
 
-        PacketContext ctx = packetWindow.get(seq);  // look up the corresponding sent packet context
+        PacketContext ctx = packetWindow.get(seq);  // look up the corresponding packet context sent
         if (ctx == null) {
             log("Questionable or Duplicate ACK Received.");
             return; // we never sent a packet corresponding to this seq#, or we've already received an ack -> discard
         }
 
         if (ctx.packet.get("seq").getAsInt() == seq) {
-            packetWindow.remove(seq); // remove this packet from the window
+            packetWindow.remove(seq);                                   // remove this packet from the window
             long diff = System.currentTimeMillis() - ctx.sendTime;
-            slidingWindow.push(diff);
-            recomputeRTT();         // estimate rtt
-            waiting = false;     // we can now send another packet
+            recomputeRTT(diff);                                         // estimate rtt
+            waiting = false;                                            // we can now send another packet
         }
     }
 
@@ -193,14 +198,16 @@ public class Sender {
         pendingData = null;
     }
 
-    private void retransmitOutdated() throws IOException {
+    private void tryRetransmitOutdated() throws IOException {
         for (Map.Entry<Integer, PacketContext> entry : packetWindow.entrySet()) {
             PacketContext ctx = entry.getValue();
             int seq = entry.getKey();
-            long diff = System.currentTimeMillis() - ctx.sendTime;
+
+            long diff = System.currentTimeMillis() - ctx.sendTime; // track how long ago we sent the packet
             log("seq: " + seq +  " diff: " + diff);
 
-            if (diff > RTTms * 2L) {
+            if (diff > RTTms * 2L) { // timeout occurs, so we must resend.
+                anyDropped = true;
                 log("Resending packet...");
                 send(ctx.packet);
                 packetWindow.put(seq, new PacketContext(ctx.packet, System.currentTimeMillis()));  // update the send time
@@ -208,17 +215,18 @@ public class Sender {
         }
     }
 
-    private void recomputeRTT() {
-        int rtt = 0;
-        int limit = Math.min(maxWindowSize, slidingWindow.size());
-        for (int i = 0; i < limit; i++) {
-            rtt += slidingWindow.get(i);
-        }
-        rtt /= limit;
-        log("New RTT: " + rtt);
-        this.RTTms = rtt;
+    private void recomputeRTT(long currentRTT) {
+        RTTms = (int) ((alpha * RTTms) + (1-alpha) * currentRTT); // use weighted computing algorithm
     }
 
+    private void adjustWindowSize() {
+        if (!anyDropped) {
+            maxWindowSize = (int) Math.pow(2.0, windowGrowthRate++); // grow until we drop a packet
+        } else {
+            maxWindowSize /= 2; //
+        }
+      //  log("- - - - - New Window: " + maxWindowSize + " - - - - -");
+    }
 
 
 

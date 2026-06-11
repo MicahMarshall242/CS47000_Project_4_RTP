@@ -19,7 +19,9 @@ public class Receiver {
     private InetSocketAddress remoteAddress = null;  
     private Gson gson = new Gson();
     private final Map<Integer, JsonObject> ackTracker;
+    private final SortedMap<Integer, JsonObject> packets;
     private int lastSeqNum;
+    private int expectedSeq; // field to help with ordered packet printing
 
     public Receiver() throws IOException {
         channel = DatagramChannel.open();
@@ -29,12 +31,16 @@ public class Receiver {
         lastSeqNum =-1;
         channel.register(selector, SelectionKey.OP_READ);
         this.ackTracker = new HashMap<>();
+        this.packets = new TreeMap<>();
+        this.expectedSeq = 0;
+
         InetSocketAddress local = (InetSocketAddress) channel.getLocalAddress();
         log("Bound to port " + local.getPort());
     }
 
     private void log(String message) {
         System.err.println(message);
+        System.err.flush();
     }
 
 
@@ -79,10 +85,13 @@ public class Receiver {
                 while (iter.hasNext()) {
                     SelectionKey key = iter.next();
                     if (key.isReadable()) {
-                        JsonObject msg = receive();
-                        if (msg != null) {
-                           handleIncomingMsg(msg);
+                        JsonObject msg; //= receive();
+                        while ((msg = receive()) != null) {
+                            handleIncomingMsg(msg);
                         }
+//                        if (msg != null) {
+//                           handleIncomingMsg(msg);
+//                        }
                     }
                     iter.remove();
                 }
@@ -91,38 +100,57 @@ public class Receiver {
     }
     // handle the received message + send an ack
     private void handleIncomingMsg(JsonObject msg) throws IOException {
+        log("Intaking: " + msg.get("seq").getAsInt());
         if (!msg.has("seq") || !msg.has("data")) {
             log("Received garbage packet!");
             return; // we got complete garbage that we don't know how to interpret
         }
         int receivedSeq = msg.get("seq").getAsInt();
 
-        if (receivedSeq <= lastSeqNum) {
-            log("received duplicate packet");
-            return; // discard the packet. it is a duplicate
+        JsonObject ack = makeAck(receivedSeq); // always send the acks immediately, even if received out of order to prevent
+        send(ack);                              // throttling of the network
+
+        if (receivedSeq < expectedSeq) {
+            log("received duplicate packet"); // discard the packet. it is a duplicate
+            return;
         }
-        lastSeqNum = receivedSeq;
 
-        // sout the data
-        System.out.print(msg.get("data").getAsString());
-        System.out.flush();
-
-        // build and send an ack
-        JsonObject ack = new JsonObject();
-        int seq = msg.get("seq").getAsInt();
-        ack.addProperty("type", "ack");
-        ack.addProperty("seq", seq);
-
-
-        //  ackTracker.put(seq, ack);
-        send(ack);
-
+        //boolean alreadyAdded = packets.get(receivedSeq) != null;
+        if (receivedSeq == 8) {
+            log("expected at 8: " + expectedSeq);
+            log("unprocessed packets: " + packets.keySet());
+        }
+        if (receivedSeq == expectedSeq) {
+            print(msg);                     // sout the data
+            expectedSeq++;                  // point to the next packet
+            packetFlush();                  // see if we can now print out others
+        } else {
+            packets.put(receivedSeq, msg);
+        }
     }
 
+    private JsonObject makeAck(int seq) {
+        JsonObject ack = new JsonObject();
+        ack.addProperty("type", "ack");
+        ack.addProperty("seq", seq);
+        return ack;
+    }
 
+    private void print(JsonObject msg) {
+        System.out.print(msg.get("data").getAsString());
+        System.out.flush();
+    }
 
+    private void packetFlush() {
+        if (packets.isEmpty()) return;
 
+        while (packets.containsKey(expectedSeq)) { // keep flushing until the next seq not found
+            JsonObject nextPacket = packets.remove(expectedSeq);
+            print(nextPacket);
+            expectedSeq++;
+        }
 
+    }
     public static void main(String[] args) {
         try {
             Receiver receiver = new Receiver();

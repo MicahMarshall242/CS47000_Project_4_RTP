@@ -23,9 +23,9 @@ public class Sender {
     private InetSocketAddress remoteAddress = null;  
     private boolean waiting = false;
     private final Gson gson = new Gson();
-    private static final int maxWindowSize = 2;
-    private final Map<Integer, JsonObject> packetWindow;
-    private int itemsInBuffer;
+    private static final int maxWindowSize = 5;
+    public static final int RTTms = 1000;
+    private final Map<Integer, PacketContext> packetWindow;
     private int nextSeq = 0;
 
     private final BlockingQueue<String> inputQueue = new LinkedBlockingQueue<>();
@@ -37,7 +37,6 @@ public class Sender {
         this.host = host;
         this.port = port;
         this.packetWindow = new HashMap<>(); //             NOTE: not using this yet
-        this.itemsInBuffer = 0;
         channel = DatagramChannel.open();
         channel.bind(new InetSocketAddress(0));
         channel.configureBlocking(false);
@@ -139,7 +138,11 @@ public class Sender {
                 sendNext();
             }
 
-            if (eof && !waiting && pendingData == null) {
+            if (!packetWindow.isEmpty()) {
+                retransmitOutdated();
+            }
+
+            if (eof && !waiting && pendingData == null && packetWindow.isEmpty()) {
                 log("All done!");
                 System.exit(0);
             }
@@ -158,13 +161,15 @@ public class Sender {
         }
         int seq = ack.get("seq").getAsInt();
 
-        JsonObject sent = packetWindow.get(seq); // look up the corresponding sent packet
-        if (sent == null) {
+        PacketContext ctx = packetWindow.get(seq);  // look up the corresponding sent packet context
+        if (ctx == null) {
             log("Questionable or Duplicate ACK Received.");
             return; // we never sent a packet corresponding to this seq#, or we've already received an ack -> discard
         }
 
-        if (sent.get("seq").getAsInt() == seq) {
+
+
+        if (ctx.packet.get("seq").getAsInt() == seq) {
             packetWindow.remove(seq); // remove this packet from the window
             waiting = false;     // we can now send another packet
         }
@@ -175,7 +180,7 @@ public class Sender {
         msg.addProperty("type", "msg");
         msg.addProperty("data", pendingData);
         msg.addProperty("seq", nextSeq);
-        packetWindow.put(nextSeq, msg); // save this message until it's acked
+        packetWindow.put(nextSeq, new PacketContext(msg, System.currentTimeMillis())); // save this message until it's acked
 
         send(msg); // send it out
 
@@ -185,6 +190,24 @@ public class Sender {
         nextSeq++; // just increment by 1 for now
         pendingData = null;
     }
+
+    private void retransmitOutdated() throws IOException {
+        for (Map.Entry<Integer, PacketContext> entry : packetWindow.entrySet()) {
+            PacketContext ctx = entry.getValue();
+            int seq = entry.getKey();
+            long diff = System.currentTimeMillis() - ctx.sendTime;
+            log("seq: " + seq +  " diff: " + diff);
+            if (diff > RTTms) {
+                log("Resending packet...");
+                send(ctx.packet);
+                packetWindow.put(seq, new PacketContext(ctx.packet, System.currentTimeMillis()));  // update the send time
+            }
+        }
+    }
+
+
+
+
 
     public static void main(String[] args) {
         if (args.length < 2) {
